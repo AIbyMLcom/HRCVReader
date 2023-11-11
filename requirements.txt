@@ -1,10 +1,9 @@
-langchain
-streamlit
-openai
-tiktoken
+gradio
 python-dotenv
-unstructured
-pinecone-client
+langchain
 pypdf
-sentence_transformers
-uuid
+openai
+chromadb
+tiktoken
+docx2txt
+black

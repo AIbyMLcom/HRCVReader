@@ -1,72 +1,137 @@
-import streamlit as st
-from dotenv import load_dotenv
-from utils import *
-import uuid
+import dotenv
 
-#Creating session variables
-if 'unique_id' not in st.session_state:
-    st.session_state['unique_id'] =''
+dotenv.find_dotenv()
+dotenv.load_dotenv()
 
-def main():
-    load_dotenv()
+import gradio as gr
+import sys
+import os
+import argparse
+import src.color as color
 
-    st.set_page_config(page_title="Resume Screening Assistance")
-    st.title("HR - Resume Screening Assistance...💁 ")
-    st.subheader("I can help you in resume screening process")
+from langchain.document_loaders import PyPDFLoader
+from langchain.document_loaders import Docx2txtLoader
+from langchain.document_loaders import TextLoader
+from langchain.text_splitter import CharacterTextSplitter
+from langchain.vectorstores import Chroma
+from langchain.chains import LLMChain
+from langchain.retrievers.multi_query import MultiQueryRetriever
+from langchain.prompts import ChatPromptTemplate
+from src.openai import embeddings, chat_llm
 
-    job_description = st.text_area("Please paste the 'JOB DESCRIPTION' here...",key="1")
-    document_count = st.text_input("No.of 'RESUMES' to return",key="2")
-    # Upload the Resumes (pdf files)
-    pdf = st.file_uploader("Upload resumes here, only PDF files allowed", type=["pdf"],accept_multiple_files=True)
-
-    submit=st.button("Help me with the analysis")
-
-    if submit:
-        with st.spinner('Wait for it...'):
-
-            #Creating a unique ID, so that we can use to query and get only the user uploaded documents from PINECONE vector store
-            st.session_state['unique_id']=uuid.uuid4().hex
-
-            #Create a documents list out of all the user uploaded pdf files
-            final_docs_list=create_docs(pdf,st.session_state['unique_id'])
-
-            #Displaying the count of resumes that have been uploaded
-            st.write("*Resumes uploaded* :"+str(len(final_docs_list)))
-
-            #Create embeddings instance
-            embeddings=create_embeddings_load_data()
-
-            #Push data to PINECONE
-            push_to_pinecone("fa7e467f-3049-41e0-8750-2e3ab8d84e49","gcp-free","test",embeddings,final_docs_list)
-
-            #Fecth relavant documents from PINECONE
-            relavant_docs=similar_docs(job_description,document_count,"fa7e467f-3049-41e0-8750-2e3ab8d84e49","gcp-free","test",embeddings,st.session_state['unique_id'])
-
-            #t.write(relavant_docs)
-
-            #Introducing a line separator
-            st.write(":heavy_minus_sign:" * 30)
-
-            #For each item in relavant docs - we are displaying some info of it on the UI
-            for item in range(len(relavant_docs)):
-                
-                st.subheader("👉 "+str(item+1))
-
-                #Displaying Filepath
-                st.write("**File** : "+relavant_docs[item][0].metadata['name'])
-
-                #Introducing Expander feature
-                with st.expander('Show me 👀'): 
-                    st.info("**Match Score** : "+str(relavant_docs[item][1]))
-                    #st.write("***"+relavant_docs[item][0].page_content)
-                    
-                    #Gets the summary of the current item using 'get_summary' function that we have created which uses LLM & Langchain chain
-                    summary = get_summary(relavant_docs[item][0])
-                    st.write("**Summary** : "+summary)
-
-        st.success("Hope I was able to save your time❤️")
+DOCUMENT_BASE = "./docs"
 
 
-#Invoking main function
-if __name__ == '__main__':
-    main()
+def init_and_create_store() -> Chroma:
+    documents = []
+    for file in os.listdir("docs"):
+        if file.endswith(".pdf"):
+            pdf_path = os.path.join(DOCUMENT_BASE, file)
+            loader = PyPDFLoader(pdf_path)
+            documents.extend(loader.load())
+        elif file.endswith(".docx") or file.endswith(".doc"):
+            doc_path = os.path.join(DOCUMENT_BASE, file)
+            loader = Docx2txtLoader(doc_path)
+            documents.extend(loader.load())
+        elif file.endswith(".txt"):
+            text_path = os.path.join(DOCUMENT_BASE, file)
+            loader = TextLoader(text_path, encoding="utf-8")
+            documents.extend(loader.load())
+    text_splitter = CharacterTextSplitter.from_tiktoken_encoder(
+        chunk_size=300, chunk_overlap=50
+    )
+    documents = text_splitter.split_documents(documents)
+    vectordb = Chroma.from_documents(
+        documents, embedding=embeddings, persist_directory="./data"
+    )
+    vectordb.persist()
+    return vectordb
+
+
+def ask_gpt(question: str, prompt: str, vector_store: Chroma) -> tuple[str, str]:
+    retriever_from_llm = MultiQueryRetriever.from_llm(
+        retriever=vector_store.as_retriever(), llm=chat_llm
+    )
+    manuals = retriever_from_llm.get_relevant_documents(question)
+    information = "\n".join([manual.page_content for manual in manuals])
+
+    question_chain = LLMChain(
+        llm=chat_llm,
+        prompt=ChatPromptTemplate.from_messages(
+            [
+                (
+                    "human",
+                    "{prompt} Here are the extracted information:\n\n```{extracted_context}```\n\nQuestion: {question}",
+                ),
+                ("ai", "Response:"),
+            ]
+        ),
+        verbose=False,
+        output_key="answer",
+    )
+
+    return information, question_chain.run(
+        question=question,
+        prompt=prompt,
+        extracted_context=information,
+    )
+
+
+def init_chatbot_handler(vector_store: Chroma):
+    def handler(message: str, _: list[list[str]]):
+        _, result = ask_gpt(message, "", vector_store)
+        return result
+
+    return handler
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Langchain Question Answer Demo.")
+    parser.add_argument(
+        "-m",
+        "--mode",
+        choices=["web", "cli"],
+        help="Select mode web or cli",
+        default="cli",
+    )
+    args = parser.parse_args()
+
+    vectordb = init_and_create_store()
+    chat_history = []
+
+    if args.mode == "cli":
+        print(
+            f"{color.yellow}---------------------------------------------------------------------------------"
+        )
+        print(
+            "Langchain Question Answer Demo. You are now ready to start interacting with your documents"
+        )
+        print(
+            "---------------------------------------------------------------------------------"
+        )
+        while True:
+            query = input(f"{color.green}Prompt: ")
+            if query == "exit" or query == "quit" or query == "q" or query == "f":
+                print("Exiting")
+                sys.exit()
+            if query == "":
+                continue
+            _, result = ask_gpt(query, "", vectordb)
+            print(f"{color.white}Answer: " + result)
+            chat_history.append((query, result))
+
+    else:
+        CSS = """
+        .contain { display: flex; flex-direction: column; }
+        .gradio-container { height: 100vh !important; }
+        #component-0 { height: 100%; }
+        #component-3 { flex-grow: 1; overflow: auto;}
+        """
+
+        message_handler = init_chatbot_handler(vectordb)
+        demo = gr.ChatInterface(
+            message_handler,
+            title="Langchain Question Answer Demo",
+            css=CSS,
+        )
+        demo.launch(share=True)

@@ -1,0 +1,14 @@
+{
+  "cSpell.words": [
+    "dotenv",
+    "gradio",
+    "langchain",
+    "openai",
+    "tiktoken",
+    "vectordb",
+    "vectorstores"
+  ],
+  "[python]": {
+    "editor.defaultFormatter": "ms-python.black-formatter"
+  },
+}
